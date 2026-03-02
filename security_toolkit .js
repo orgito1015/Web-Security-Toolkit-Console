@@ -1,5 +1,5 @@
 /**
- * Browser Security Analysis Toolkit v3.0
+ * Browser Security Analysis Toolkit v4.0
  * Modular runtime reconnaissance framework for educational and authorized security research.
  * NON-DESTRUCTIVE: observe and log only — no exploitation, no data modification.
  *
@@ -49,23 +49,29 @@
 
   // ─── Internal State Registry ────────────────────────────────────────────────
   const _state = {
-    version:           '3.0',
-    startTime:         performance.now(),
-    requests:          [],
-    endpointMap:       new Map(),        // url → { count, statuses, durations }
-    tokens:            {},
-    tokenEntropy:      {},
-    securitySignals:   { high: [], medium: [], low: [] },
-    thirdPartyDomains: new Set(),
-    apiEndpoints:      new Set(),
-    sinkInvocations:   [],
-    scriptTagsAdded:   [],
-    domScore:          0,
-    riskScore:         0,
-    cookies:           [],
-    formAnalysis:      [],
-    domStats:          {},
-    reportReady:       false,
+    version:              '4.0',
+    startTime:            performance.now(),
+    requests:             [],
+    endpointMap:          new Map(),        // url → { count, statuses, durations }
+    tokens:               {},
+    tokenEntropy:         {},
+    securitySignals:      { high: [], medium: [], low: [] },
+    thirdPartyDomains:    new Set(),
+    apiEndpoints:         new Set(),
+    sinkInvocations:      [],
+    scriptTagsAdded:      [],
+    domScore:             0,
+    riskScore:            0,
+    cookies:              [],
+    formAnalysis:         [],
+    domStats:             {},
+    websocketConnections: [],
+    postMessages:         [],
+    jwtFindings:          [],
+    serviceWorkers:       [],
+    permissions:          [],
+    piiFindings:          {},
+    reportReady:          false,
   };
 
   // ─── Utility: Shannon Entropy ────────────────────────────────────────────────
@@ -92,7 +98,7 @@
   // ─── Module: Core ───────────────────────────────────────────────────────────
   const Core = {
     init() {
-      console.log('%c 🔐 Browser Security Analysis Toolkit v3.0 ', C.banner);
+      console.log('%c 🔐 Browser Security Analysis Toolkit v4.0 ', C.banner);
       log(C.info, `ℹ  Target : ${location.href}`);
       log(C.info, `ℹ  Date   : ${new Date().toISOString()}`);
       log(C.info, `ℹ  Agent  : ${navigator.userAgent.substring(0, 80)}`);
@@ -743,6 +749,443 @@
     },
   };
 
+  // ─── Module: WebSocketMonitor ────────────────────────────────────────────────
+  const WebSocketMonitor = {
+    init() {
+      if (typeof WebSocket === 'undefined') return;
+      const _WS  = window.WebSocket;
+      const self = this;
+
+      window.WebSocket = function (url, protocols) {
+        const ws    = protocols ? new _WS(url, protocols) : new _WS(url);
+        const entry = { url, protocols: protocols || [], messageCount: 0, messages: [], opened: false, closed: false };
+        _state.websocketConnections.push(entry);
+
+        ws.addEventListener('open', () => {
+          entry.opened = true;
+          log(C.info, `ℹ WebSocket opened: ${url}`);
+          if (url.startsWith('ws://')) {
+            log(C.risk, `🚨 Unencrypted WebSocket (ws://) connection: ${url}`);
+            _state.securitySignals.high.push(`Unencrypted WebSocket: ${url}`);
+          } else {
+            _state.securitySignals.low.push(`WebSocket connection: ${url}`);
+          }
+        });
+
+        ws.addEventListener('message', evt => {
+          entry.messageCount++;
+          const preview = typeof evt.data === 'string' ? evt.data.substring(0, 100) : '[binary]';
+          entry.messages.push({ direction: 'recv', preview, time: Date.now() });
+          if (entry.messageCount <= 3) log(C.muted, `  ← WS recv [${url.substring(0, 50)}]: ${preview}`);
+          if (typeof evt.data === 'string' && SENSITIVE_KEYS.some(k => evt.data.toLowerCase().includes(k))) {
+            log(C.warn, `⚠ Potentially sensitive data in WebSocket message from ${url.substring(0, 60)}`);
+            _state.securitySignals.medium.push(`Sensitive keyword in WebSocket message: ${url}`);
+          }
+        });
+
+        ws.addEventListener('close', () => { entry.closed = true; });
+
+        const _origSend = ws.send.bind(ws);
+        ws.send = function (data) {
+          const preview = typeof data === 'string' ? data.substring(0, 100) : '[binary]';
+          entry.messages.push({ direction: 'send', preview, time: Date.now() });
+          const sendCount = entry.messages.filter(m => m.direction === 'send').length;
+          if (sendCount <= 3) log(C.muted, `  → WS send [${url.substring(0, 50)}]: ${preview}`);
+          return _origSend(data);
+        };
+        return ws;
+      };
+      window.WebSocket.prototype  = _WS.prototype;
+      window.WebSocket.CONNECTING = _WS.CONNECTING;
+      window.WebSocket.OPEN       = _WS.OPEN;
+      window.WebSocket.CLOSING    = _WS.CLOSING;
+      window.WebSocket.CLOSED     = _WS.CLOSED;
+    },
+
+    run() {
+      console.groupCollapsed('%c🔌 WebSocket Monitor', C.heading);
+      if (_state.websocketConnections.length) {
+        log(C.info, `ℹ ${_state.websocketConnections.length} WebSocket connection(s) detected`);
+        table(_state.websocketConnections.reduce((acc, c, i) => {
+          acc[i] = `${c.url.substring(0, 80)} | msgs: ${c.messageCount} | open: ${c.opened} | closed: ${c.closed}`;
+          return acc;
+        }, {}));
+      } else {
+        log(C.ok, '✓ No WebSocket connections detected — constructor hooked for future connections');
+      }
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: PostMessageMonitor ───────────────────────────────────────────────
+  // Listens for 'message' events on window (the standard cross-frame messaging API).
+  const PostMessageMonitor = {
+    init() {
+      window.addEventListener('message', evt => {
+        const dataStr  = typeof evt.data === 'string'
+          ? evt.data
+          : evt.data instanceof Object ? JSON.stringify(evt.data) : String(evt.data);
+        const entry    = { origin: evt.origin, dataType: typeof evt.data, preview: dataStr.substring(0, 100), time: Date.now() };
+        _state.postMessages.push(entry);
+        const isCross  = evt.origin !== location.origin && evt.origin !== 'null';
+        log(isCross ? C.warn : C.info, `${isCross ? '⚠' : 'ℹ'} postMessage from ${evt.origin}: ${entry.preview}`);
+        if (isCross) {
+          _state.securitySignals.medium.push(`Cross-origin postMessage from: ${evt.origin}`);
+        }
+        if (SENSITIVE_KEYS.some(k => dataStr.toLowerCase().includes(k))) {
+          log(C.warn, `⚠ Potentially sensitive data in postMessage from ${evt.origin}`);
+          _state.securitySignals.medium.push(`Sensitive keyword in postMessage from: ${evt.origin}`);
+        }
+      }, true);
+    },
+
+    run() {
+      console.groupCollapsed('%c📨 postMessage Monitor', C.heading);
+      if (_state.postMessages.length) {
+        log(C.info, `ℹ ${_state.postMessages.length} postMessage(s) captured`);
+        table(_state.postMessages.slice(0, 10).reduce((acc, m, i) => {
+          acc[i] = `${m.origin} | ${m.preview}`;
+          return acc;
+        }, {}));
+      } else {
+        log(C.ok, '✓ No postMessage events captured — listener active for future messages');
+      }
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: HeadersInspector ─────────────────────────────────────────────────
+  const HeadersInspector = {
+    _SECURITY_HEADERS: [
+      'Content-Security-Policy',
+      'X-Frame-Options',
+      'X-Content-Type-Options',
+      'Referrer-Policy',
+      'Permissions-Policy',
+      'Strict-Transport-Security',
+    ],
+
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c🛡 Headers Inspector', C.heading);
+
+      // Check meta http-equiv tags for security headers
+      const found = {};
+      document.querySelectorAll('meta[http-equiv]').forEach(m => {
+        found[m.getAttribute('http-equiv').toLowerCase()] = m.getAttribute('content') || '';
+      });
+
+      this._SECURITY_HEADERS.forEach(h => {
+        if (found[h.toLowerCase()] !== undefined) {
+          log(C.ok, `✓ Meta security header present: ${h} = "${found[h.toLowerCase()].substring(0, 60)}"`);
+        } else {
+          log(C.warn, `⚠ Meta security header not in <meta>: ${h} (may be set via HTTP header)`);
+          _state.securitySignals.low.push(`Security header absent from meta: ${h}`);
+        }
+      });
+
+      // Transport security
+      if (location.protocol === 'https:') {
+        log(C.ok, '✓ Page loaded over HTTPS');
+      } else {
+        log(C.risk, '🚨 Page loaded over HTTP — transport not encrypted');
+        _state.securitySignals.high.push('Page loaded over HTTP (no TLS)');
+      }
+
+      // Referrer-Policy via document.referrerPolicy
+      const rp = document.referrerPolicy;
+      if (rp) {
+        const safe = ['no-referrer', 'same-origin', 'strict-origin', 'strict-origin-when-cross-origin'].includes(rp);
+        log(safe ? C.ok : C.warn, `${safe ? '✓' : '⚠'} document.referrerPolicy = "${rp}"`);
+        if (!safe) _state.securitySignals.low.push(`Loose referrer policy: ${rp}`);
+      } else {
+        log(C.warn, '⚠ No referrer policy detected');
+        _state.securitySignals.low.push('No referrer policy detected');
+      }
+
+      // Report all found meta headers
+      if (Object.keys(found).length) {
+        log(C.info, `ℹ Meta http-equiv headers found: ${Object.keys(found).join(', ')}`);
+      }
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: JWTAnalyzer ──────────────────────────────────────────────────────
+  const JWTAnalyzer = {
+    _jwtRe: /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*$/,
+
+    _decode(token) {
+      try {
+        const parts = token.split('.');
+        const b64   = s => JSON.parse(atob(s.replace(/-/g, '+').replace(/_/g, '/')));
+        return { header: b64(parts[0]), payload: b64(parts[1]) };
+      } catch (_) { return null; }
+    },
+
+    _check(value, source) {
+      const v = (value || '').trim();
+      if (!this._jwtRe.test(v)) return;
+      const decoded = this._decode(v);
+      if (!decoded) return;
+
+      const alg    = decoded.header.alg || 'unknown';
+      const entry  = { source, alg, sub: decoded.payload.sub || '', exp: decoded.payload.exp || null };
+      _state.jwtFindings.push(entry);
+
+      log(C.warn, `⚠ JWT detected in ${source}: alg=${alg}, sub="${entry.sub}"`);
+      _state.securitySignals.medium.push(`JWT in ${source}: alg=${alg}`);
+
+      if (alg === 'none') {
+        log(C.risk, `🚨 JWT with alg=none in ${source} — signature NOT verified!`);
+        _state.securitySignals.high.push(`JWT alg=none in ${source}`);
+      }
+      if (['HS256', 'HS384', 'HS512'].includes(alg)) {
+        log(C.info, `ℹ JWT uses symmetric algorithm (${alg}) in ${source}`);
+      }
+
+      if (decoded.payload.exp) {
+        const expiry   = new Date(decoded.payload.exp * 1000);
+        const expired  = expiry < new Date();
+        log(expired ? C.risk : C.ok, `${expired ? '🚨 Expired' : '✓ Expires'}: ${expiry.toISOString()} (${source})`);
+        if (expired) _state.securitySignals.medium.push(`Expired JWT in ${source}`);
+      }
+    },
+
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c🪪 JWT Analyzer', C.heading);
+      let found = 0;
+
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i), v = localStorage.getItem(k) || '';
+          if (this._jwtRe.test(v.trim())) { this._check(v, `localStorage[${k}]`); found++; }
+        }
+      } catch (_) {}
+
+      try {
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const k = sessionStorage.key(i), v = sessionStorage.getItem(k) || '';
+          if (this._jwtRe.test(v.trim())) { this._check(v, `sessionStorage[${k}]`); found++; }
+        }
+      } catch (_) {}
+
+      document.cookie.split(';').forEach(c => {
+        const idx = c.indexOf('=');
+        if (idx < 0) return;
+        const name = c.substring(0, idx).trim();
+        const val  = c.substring(idx + 1).trim();
+        if (this._jwtRe.test(val)) { this._check(val, `cookie[${name}]`); found++; }
+      });
+
+      // Scan meta content tags (some apps embed tokens there)
+      document.querySelectorAll('meta[content]').forEach(m => {
+        const v = (m.getAttribute('content') || '').trim();
+        if (this._jwtRe.test(v)) { this._check(v, `meta[${m.name || m.getAttribute('http-equiv') || '?'}]`); found++; }
+      });
+
+      if (!found) log(C.ok, '✓ No JWT tokens detected in storage, cookies, or meta tags');
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: PrototypePollutionChecker ────────────────────────────────────────
+  const PrototypePollutionChecker = {
+    _SINKS: ['__proto__', 'constructor', 'prototype'],
+
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c☣ Prototype Pollution Checker', C.heading);
+
+      // Detect unexpected enumerable own-properties on Object.prototype
+      const polluted = [];
+      for (const key in Object.prototype) {
+        if (Object.prototype.hasOwnProperty.call(Object.prototype, key)) polluted.push(key);
+      }
+      if (polluted.length) {
+        log(C.risk, `🚨 Object.prototype polluted — unexpected own properties: ${polluted.join(', ')}`);
+        _state.securitySignals.high.push(`Object.prototype pollution: ${polluted.join(', ')}`);
+      } else {
+        log(C.ok, '✓ Object.prototype appears clean');
+      }
+
+      // Check URL query parameters for prototype pollution payloads
+      let urlPollution = false;
+      try {
+        const params = new URLSearchParams(location.search);
+        for (const [key] of params) {
+          if (this._SINKS.some(s => key.includes(s)) || /\[__proto__\]|\[constructor\]|\[prototype\]/.test(key)) {
+            log(C.risk, `🚨 Prototype pollution payload in URL param: ${key}`);
+            _state.securitySignals.high.push(`Prototype pollution in URL: ${key}`);
+            urlPollution = true;
+          }
+        }
+      } catch (_) {}
+      if (!urlPollution) log(C.ok, '✓ No prototype pollution patterns in URL query string');
+
+      // Check URL fragment
+      if (this._SINKS.some(s => location.hash.includes(s))) {
+        log(C.warn, '⚠ Prototype pollution pattern in URL fragment');
+        _state.securitySignals.medium.push('Prototype pollution pattern in URL hash');
+      }
+
+      // Scan inline scripts for prototype pollution assignment patterns
+      let scriptPollution = 0;
+      document.querySelectorAll('script:not([src])').forEach(s => {
+        if (/\.__proto__\s*=|\[['"]__proto__['"]\]\s*=|Object\.prototype\.[a-zA-Z_]+\s*=/.test(s.textContent)) {
+          scriptPollution++;
+        }
+      });
+      if (scriptPollution) {
+        log(C.risk, `🚨 ${scriptPollution} inline script(s) contain prototype mutation patterns`);
+        _state.securitySignals.high.push(`Prototype mutation in ${scriptPollution} inline script(s)`);
+      } else {
+        log(C.ok, '✓ No prototype mutation patterns in inline scripts');
+      }
+
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: ServiceWorkerInspector ──────────────────────────────────────────
+  const ServiceWorkerInspector = {
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c👷 Service Worker Inspector', C.heading);
+      if (!('serviceWorker' in navigator)) {
+        log(C.muted, 'Service Worker API not available in this context');
+        console.groupEnd();
+        return;
+      }
+      navigator.serviceWorker.getRegistrations().then(regs => {
+        _state.serviceWorkers = regs.map(r => ({
+          scope:  r.scope,
+          state:  r.active ? r.active.state : 'inactive',
+          script: r.active ? r.active.scriptURL : (r.installing ? r.installing.scriptURL : '(unknown)'),
+        }));
+        if (!regs.length) {
+          log(C.ok, '✓ No service workers registered');
+        } else {
+          log(C.info, `ℹ ${regs.length} service worker(s) registered`);
+          table(_state.serviceWorkers.reduce((acc, sw, i) => {
+            acc[`SW #${i}`] = `scope=${sw.scope} | state=${sw.state} | script=${sw.script.substring(0, 80)}`;
+            return acc;
+          }, {}));
+          regs.forEach((reg, i) => {
+            const script = _state.serviceWorkers[i].script;
+            _state.securitySignals.low.push(`Service Worker registered: scope=${reg.scope}`);
+            try {
+              if (new URL(script).origin !== location.origin) {
+                log(C.risk, `🚨 Service Worker script from foreign origin: ${script}`);
+                _state.securitySignals.high.push(`Cross-origin service worker: ${script}`);
+              }
+            } catch (_) {}
+          });
+        }
+      }).catch(e => log(C.muted, `(Service Worker query failed: ${e.message})`));
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: PermissionInspector ─────────────────────────────────────────────
+  const PermissionInspector = {
+    _HIGH_RISK: ['geolocation', 'camera', 'microphone'],
+    _ALL:       ['geolocation', 'notifications', 'camera', 'microphone', 'clipboard-read', 'clipboard-write', 'persistent-storage', 'payment-handler'],
+
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c🔏 Permission Inspector', C.heading);
+      if (!navigator.permissions || !navigator.permissions.query) {
+        log(C.muted, 'Permissions API not available in this context');
+        console.groupEnd();
+        return;
+      }
+      const checks = this._ALL.map(name =>
+        navigator.permissions.query({ name }).then(r => ({ name, state: r.state })).catch(() => ({ name, state: 'unsupported' }))
+      );
+      Promise.all(checks).then(results => {
+        _state.permissions = results;
+        const rows = {};
+        results.forEach(r => {
+          const icon = r.state === 'granted' ? '🟢' : r.state === 'denied' ? '🔴' : r.state === 'prompt' ? '🟡' : '⬛';
+          rows[r.name] = `${icon} ${r.state}`;
+        });
+        table(rows);
+
+        const granted = results.filter(r => r.state === 'granted');
+        if (granted.length) {
+          granted.forEach(r => {
+            if (this._HIGH_RISK.includes(r.name)) {
+              log(C.risk, `🚨 Sensitive permission GRANTED: ${r.name}`);
+              _state.securitySignals.high.push(`Sensitive permission granted: ${r.name}`);
+            } else {
+              log(C.warn, `⚠ Permission granted: ${r.name}`);
+              _state.securitySignals.medium.push(`Permission granted: ${r.name}`);
+            }
+          });
+        } else {
+          log(C.ok, '✓ No sensitive permissions currently granted');
+        }
+      });
+      console.groupEnd();
+    },
+  };
+
+  // ─── Module: SensitiveDOMScanner ─────────────────────────────────────────────
+  const SensitiveDOMScanner = {
+    _PII: [
+      // Pattern-based detection — may produce false positives; verify matches manually.
+      { name: 'Credit Card',  re: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b/ },
+      { name: 'Email',        re: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/ },
+      { name: 'US SSN',       re: /\b\d{3}-\d{2}-\d{4}\b/ },
+      { name: 'AWS Key',      re: /\bAKIA[0-9A-Z]{16}\b/ },
+      { name: 'JWT Token',    re: /eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*/ },
+      { name: 'Private Key',  re: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/ },
+      // RFC-1918 private ranges only; octet bounds are not individually validated.
+      { name: 'Private IPv4', re: /\b(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b/ },
+    ],
+
+    init() {},
+
+    run() {
+      console.groupCollapsed('%c🔎 Sensitive DOM Scanner', C.heading);
+      const findings = {};
+      const MAX      = 2000;
+      const walker   = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      let node, scanned = 0;
+
+      while ((node = walker.nextNode()) && scanned < MAX) {
+        const text = (node.nodeValue || '').trim();
+        if (!text) continue;
+        scanned++;
+        this._PII.forEach(({ name, re }) => {
+          if (re.test(text)) findings[name] = (findings[name] || 0) + 1;
+        });
+      }
+
+      _state.piiFindings = findings;
+
+      if (Object.keys(findings).length) {
+        log(C.risk, '🚨 Potential PII / sensitive data found in visible DOM text:');
+        table(Object.fromEntries(Object.entries(findings).map(([k, v]) => [k, `${v} occurrence(s)`])));
+        Object.keys(findings).forEach(name => {
+          if (!_state.securitySignals.high.some(s => s.includes(name))) {
+            _state.securitySignals.high.push(`PII in DOM text: ${name}`);
+          }
+        });
+      } else {
+        log(C.ok, `✓ No PII patterns detected in DOM text (${scanned} text nodes scanned)`);
+      }
+      console.groupEnd();
+    },
+  };
+
   // ─── Security Scoring Engine ─────────────────────────────────────────────────
   function computeRiskScore() {
     const high   = _state.securitySignals.high.length;
@@ -772,9 +1215,12 @@
       'Requests Captured':     _state.requests.length,
       'Token Fields':          Object.keys(_state.tokens).length,
       'Third-Party Domains':   _state.thirdPartyDomains.size,
-      'Sensitive Storage':     _state.securitySignals.high.filter(s => s.includes('Sensitive')).length,
       'DOM Sink Invocations':  _state.sinkInvocations.length,
       'Dynamic Scripts Added': _state.scriptTagsAdded.length,
+      'WebSocket Connections': _state.websocketConnections.length,
+      'postMessages Captured': _state.postMessages.length,
+      'JWTs Detected':         _state.jwtFindings.length,
+      'PII Types in DOM':      Object.keys(_state.piiFindings).length,
       'Signals — High':        high,
       'Signals — Medium':      medium,
       'Signals — Low':         low,
@@ -800,40 +1246,64 @@
     }
 
     log(style, `✅ Classification: ${label}`);
-    console.log('%c Runtime inspection active. Network hooks live. Use window.Toolkit.exportReport() for full JSON export. ', C.banner);
+    console.log('%c Runtime inspection active. Network + WebSocket + postMessage hooks live. Use window.Toolkit.exportReport() for full JSON export. ', C.banner);
     console.groupEnd();
   }
 
   // ─── Central Toolkit Object ──────────────────────────────────────────────────
-  const modules = [Core, NetworkMonitor, TokenAnalyzer, EventMapper, StorageAnalyzer, ScriptAnalyzer, SecuritySignals, PerformanceMonitor, DOMAnalyzer];
+  const modules = [
+    Core,
+    NetworkMonitor,
+    TokenAnalyzer,
+    EventMapper,
+    StorageAnalyzer,
+    ScriptAnalyzer,
+    SecuritySignals,
+    PerformanceMonitor,
+    DOMAnalyzer,
+    WebSocketMonitor,
+    PostMessageMonitor,
+    HeadersInspector,
+    JWTAnalyzer,
+    PrototypePollutionChecker,
+    ServiceWorkerInspector,
+    PermissionInspector,
+    SensitiveDOMScanner,
+  ];
 
   window.Toolkit = {
-    version: '3.0',
+    version: '4.0',
     state:   _state,
 
     /** Returns a full JSON-serialisable analysis report. */
     exportReport() {
       return {
-        version:           this.version,
-        timestamp:         new Date().toISOString(),
-        target:            location.href,
-        riskScore:         _state.riskScore,
-        riskLabel:         riskLabel(_state.riskScore).label,
+        version:              this.version,
+        timestamp:            new Date().toISOString(),
+        target:               location.href,
+        riskScore:            _state.riskScore,
+        riskLabel:            riskLabel(_state.riskScore).label,
         signals: {
           high:   _state.securitySignals.high,
           medium: _state.securitySignals.medium,
           low:    _state.securitySignals.low,
         },
-        endpoints:         [..._state.apiEndpoints],
-        thirdPartyDomains: [..._state.thirdPartyDomains],
-        requests:          _state.requests.map(r => ({ method: r.method, url: r.url, status: r.status, duration: r.duration, size: r.size })),
+        endpoints:            [..._state.apiEndpoints],
+        thirdPartyDomains:    [..._state.thirdPartyDomains],
+        requests:             _state.requests.map(r => ({ method: r.method, url: r.url, status: r.status, duration: r.duration, size: r.size })),
         // Token values are redacted; only entropy metadata is exported
-        tokens:            Object.fromEntries(Object.entries(_state.tokens).map(([k]) => [k, `(redacted) entropy: ${(_state.tokenEntropy[k] || 0).toFixed(2)}`])),
-        cookies:           _state.cookies.map(c => ({ name: c.name, entropy: c.entropy })),
-        domStats:          _state.domStats,
-        sinkInvocations:   _state.sinkInvocations,
-        formAnalysis:      _state.formAnalysis,
-        scriptTagsAdded:   _state.scriptTagsAdded,
+        tokens:               Object.fromEntries(Object.entries(_state.tokens).map(([k]) => [k, `(redacted) entropy: ${(_state.tokenEntropy[k] || 0).toFixed(2)}`])),
+        cookies:              _state.cookies.map(c => ({ name: c.name, entropy: c.entropy })),
+        domStats:             _state.domStats,
+        sinkInvocations:      _state.sinkInvocations,
+        formAnalysis:         _state.formAnalysis,
+        scriptTagsAdded:      _state.scriptTagsAdded,
+        websocketConnections: _state.websocketConnections.map(c => ({ url: c.url, messageCount: c.messageCount, opened: c.opened, closed: c.closed })),
+        postMessages:         _state.postMessages,
+        jwtFindings:          _state.jwtFindings,
+        serviceWorkers:       _state.serviceWorkers,
+        permissions:          _state.permissions,
+        piiFindings:          _state.piiFindings,
       };
     },
   };
