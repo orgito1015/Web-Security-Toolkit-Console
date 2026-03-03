@@ -1,4 +1,4 @@
-# Browser Security Analysis Toolkit v3.0
+# Browser Security Analysis Toolkit v4.0
 
 A modular, **non-destructive** runtime reconnaissance framework for educational and authorized security research directly from your browser's DevTools Console.
 
@@ -18,6 +18,14 @@ A modular, **non-destructive** runtime reconnaissance framework for educational 
 | 🚨 **Security Signals** | Detects iframe embedding, mixed content, open-redirect parameters, missing CSRF tokens, and sensitive data in the URL |
 | ⚡ **Performance Monitor** | Reports DOM node count, page load time, script/stylesheet count, and long tasks |
 | 🧩 **DOM Analyzer** | Hooks dangerous DOM sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function`) and watches for dynamic script/iframe injection |
+| 🔌 **WebSocket Monitor** | Hooks `WebSocket` constructor to log connections and messages; flags unencrypted `ws://` connections and sensitive data in messages |
+| 📨 **postMessage Monitor** | Listens for all `window.message` events; flags cross-origin messages and sensitive keywords |
+| 🛡 **Headers Inspector** | Scans `<meta http-equiv>` tags for security headers (CSP, X-Frame-Options, Referrer-Policy, etc.) and detects HTTP vs HTTPS |
+| 🪪 **JWT Analyzer** | Detects JWT tokens in storage, cookies, and meta tags; decodes header/payload, flags `alg=none`, and checks token expiry |
+| ☣ **Prototype Pollution Checker** | Inspects `Object.prototype` for unexpected properties; scans URL params, fragment, and inline scripts for pollution patterns |
+| 👷 **Service Worker Inspector** | Lists registered service workers; flags cross-origin SW scripts and scope details |
+| 🔏 **Permission Inspector** | Queries the Permissions API for sensitive grants (camera, microphone, geolocation, notifications…) |
+| 🔎 **Sensitive DOM Scanner** | TreeWalker scan of visible text for PII patterns: credit cards, emails, SSNs, AWS keys, private keys, JWT tokens, and internal IP addresses |
 
 All modules are **observe-only** — no data is modified or exfiltrated.
 
@@ -96,6 +104,12 @@ The exported report includes:
 - `sinkInvocations` — DOM sink calls detected at runtime
 - `formAnalysis` — form structure summary
 - `scriptTagsAdded` — dynamically injected scripts
+- `websocketConnections` — WebSocket connections (URL, message count, open/close state)
+- `postMessages` — captured cross-origin `postMessage` events
+- `jwtFindings` — JWT tokens detected in storage / cookies (algorithm, subject, expiry)
+- `serviceWorkers` — registered service workers with scope and script URL
+- `permissions` — browser permission states for sensitive APIs
+- `piiFindings` — PII pattern match counts from the DOM text scan
 
 ---
 
@@ -104,10 +118,14 @@ The exported report includes:
 The full internal state is accessible while the page is open:
 
 ```js
-window.Toolkit.state           // complete state object
-window.Toolkit.state.requests  // all captured network requests
-window.Toolkit.state.cookies   // cookie details
-window.Toolkit.state.riskScore // current risk score
+window.Toolkit.state                        // complete state object
+window.Toolkit.state.requests               // all captured network requests
+window.Toolkit.state.cookies                // cookie details
+window.Toolkit.state.riskScore              // current risk score
+window.Toolkit.state.websocketConnections   // WebSocket connections
+window.Toolkit.state.postMessages           // captured postMessage events
+window.Toolkit.state.jwtFindings            // detected JWT tokens
+window.Toolkit.state.piiFindings            // PII pattern hits in DOM
 ```
 
 ---
